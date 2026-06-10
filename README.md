@@ -1,5 +1,5 @@
-# zhenxun_join_verify
-一个适用于真寻bot的加群验证，可与welcome_msg联动
+# 真寻bot - 进群验证
+一个适用于真寻bot的进群验证，可与welcome_msg联动
 
 ## 功能介绍
 - 插件默认关闭
