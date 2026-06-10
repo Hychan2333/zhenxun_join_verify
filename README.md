@@ -33,7 +33,7 @@
 ## 关于编写
 Vibe Coding...
 
-##特别感谢
+## 特别感谢
 BingZi-233的zhenxun_plugin_group_request_handler
 https://github.com/BingZi-233/zhenxun_plugin_group_request_handler
 
