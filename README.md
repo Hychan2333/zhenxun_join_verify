@@ -1,2 +1,2 @@
 # zhenxun_join_verify
-一个适用于真寻的加群验证，可与welcome_msg联动
+一个适用于真寻bot的加群验证，可与welcome_msg联动
