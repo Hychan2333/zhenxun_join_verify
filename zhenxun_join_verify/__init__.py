@@ -6,7 +6,7 @@ import random
 import time
 from typing import Any
 
-from nonebot import on_message, on_notice
+from nonebot import get_driver, on_message, on_notice
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import (
     GroupAdminNoticeEvent,
@@ -16,6 +16,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import Rule
 from nonebot_plugin_alconna import Alconna, Args, At, Match, UniMessage, on_alconna
+from nonebot_plugin_alconna.uniseg.tools import reply_fetch
 from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import Config
@@ -29,6 +30,8 @@ from zhenxun.utils.rules import admin_check
 PLUGIN_MODULE = "zhenxun_join_verify"
 DATA_DIR = DATA_PATH / PLUGIN_MODULE
 NOTIFY_USERS_FILE = DATA_DIR / "notify_users.json"
+PENDING_VERIFICATIONS_FILE = DATA_DIR / "pending_verifications.json"
+driver = get_driver()
 
 __plugin_meta__ = PluginMetadata(
     name="进群验证",
@@ -45,6 +48,9 @@ __plugin_meta__ = PluginMetadata(
     进群验证提醒列表
     添加进群验证提醒 QQ号
     移除进群验证提醒 QQ号
+
+    中断处理：
+    回复验证消息并发送「取消验证」即可中断验证流程（需群管/群主）
     """.strip(),
     extra=PluginExtraData(
         author="AIGC_Hychan2333",
@@ -95,6 +101,7 @@ __plugin_meta__ = PluginMetadata(
 )
 
 verification_tasks: dict[tuple[int, int], dict[str, Any]] = {}
+verification_message_index: dict[str, tuple[int, int]] = {}
 permission_notify_time: dict[int, float] = {}
 welcome_reserved_until: dict[int, float] = {}
 
@@ -103,6 +110,12 @@ def _ensure_notify_file() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not NOTIFY_USERS_FILE.exists():
         NOTIFY_USERS_FILE.write_text("{}", encoding="utf-8")
+
+
+def _ensure_pending_file() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not PENDING_VERIFICATIONS_FILE.exists():
+        PENDING_VERIFICATIONS_FILE.write_text("{}", encoding="utf-8")
 
 
 def _load_notify_users() -> dict[str, list[str]]:
@@ -157,6 +170,141 @@ def _get_config_value(key: str, default: Any) -> Any:
     return Config.get_config(PLUGIN_MODULE, key, default)
 
 
+def _pending_key(group_id: int, user_id: int) -> str:
+    return f"{group_id}:{user_id}"
+
+
+def _load_pending_data() -> dict[str, dict[str, Any]]:
+    _ensure_pending_file()
+    try:
+        data = json.loads(PENDING_VERIFICATIONS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error("读取进群验证待验证状态失败", PLUGIN_MODULE, e=e)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_pending_verifications() -> None:
+    _ensure_pending_file()
+    data: dict[str, dict[str, Any]] = {}
+    for (group_id, user_id), task_info in verification_tasks.items():
+        data[_pending_key(group_id, user_id)] = {
+            "group_id": group_id,
+            "user_id": user_id,
+            "answer": task_info.get("answer"),
+            "retries": task_info.get("retries", 0),
+            "max_retries": task_info.get("max_retries"),
+            "expire_at": task_info.get("expire_at"),
+            "message_ids": [str(mid) for mid in task_info.get("message_ids", [])],
+            "welcome_reserved": bool(task_info.get("welcome_reserved")),
+        }
+    try:
+        PENDING_VERIFICATIONS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.error("保存进群验证待验证状态失败", PLUGIN_MODULE, e=e)
+
+
+def _load_pending_verifications_to_memory() -> None:
+    data = _load_pending_data()
+    now = time.time()
+    changed = False
+    for item in data.values():
+        try:
+            group_id = int(item["group_id"])
+            user_id = int(item["user_id"])
+            expire_at = float(item.get("expire_at") or now)
+            max_retries = int(item["max_retries"])
+            answer = int(item["answer"])
+        except (KeyError, TypeError, ValueError):
+            changed = True
+            continue
+
+        key = (group_id, user_id)
+        if key in verification_tasks:
+            continue
+        message_ids = [str(mid) for mid in item.get("message_ids", []) if mid]
+        verification_tasks[key] = {
+            "answer": answer,
+            "retries": int(item.get("retries", 0) or 0),
+            "max_retries": max_retries,
+            "expire_at": expire_at,
+            "message_ids": message_ids,
+            "welcome_reserved": bool(item.get("welcome_reserved")),
+            "restored": True,
+        }
+        for message_id in message_ids:
+            verification_message_index[message_id] = key
+    if changed:
+        _save_pending_verifications()
+
+
+def _extract_receipt_message_ids(receipt: Any) -> list[str]:
+    msg_ids = getattr(receipt, "msg_ids", None)
+    if not msg_ids:
+        return []
+
+    result: list[str] = []
+    for msg_id_info in msg_ids:
+        message_id = None
+        if isinstance(msg_id_info, dict):
+            message_id = msg_id_info.get("message_id")
+        else:
+            message_id = getattr(msg_id_info, "message_id", None)
+        if message_id is not None:
+            result.append(str(message_id))
+    return result
+
+
+def _bind_verification_message_ids(
+    key: tuple[int, int],
+    task_info: dict[str, Any],
+    receipt: Any,
+) -> None:
+    message_ids = _extract_receipt_message_ids(receipt)
+    if not message_ids:
+        return
+    task_info["message_ids"] = message_ids
+    for message_id in message_ids:
+        verification_message_index[message_id] = key
+    _save_pending_verifications()
+
+
+def _pop_verification_task(key: tuple[int, int]) -> dict[str, Any] | None:
+    task_info = verification_tasks.pop(key, None)
+    if not task_info:
+        return None
+
+    for message_id in task_info.get("message_ids", []):
+        verification_message_index.pop(str(message_id), None)
+    for message_id, message_key in list(verification_message_index.items()):
+        if message_key == key:
+            verification_message_index.pop(message_id, None)
+    _save_pending_verifications()
+    return task_info
+
+
+def _cancel_timeout_task(task_info: dict[str, Any] | None) -> None:
+    if not task_info:
+        return
+    task = task_info.get("task")
+    if task:
+        task.cancel()
+
+
+def _schedule_timeout_task(bot: Bot, key: tuple[int, int], task_info: dict[str, Any]):
+    if task_info.get("task"):
+        return
+    expire_at = float(task_info.get("expire_at") or time.time())
+    timeout = max(1, int(expire_at - time.time()))
+    task_info["task"] = asyncio.create_task(timeout_kick(bot, key[0], key[1], timeout))
+
+
+_load_pending_verifications_to_memory()
+
+
 async def _bot_has_group_admin_permission(bot: Bot, group_id: int) -> bool:
     try:
         member_info = await bot.get_group_member_info(
@@ -169,6 +317,30 @@ async def _bot_has_group_admin_permission(bot: Bot, group_id: int) -> bool:
             f"获取Bot群权限失败，跳过进群验证: {e}",
             PLUGIN_MODULE,
             target=group_id,
+            e=e,
+        )
+        return False
+    return member_info.get("role") in {"owner", "admin"}
+
+
+async def _is_verification_admin(
+    bot: Bot,
+    event: GroupMessageEvent,
+    session: Uninfo,
+) -> bool:
+    if await admin_check(5)(bot, event, session):
+        return True
+    try:
+        member_info = await bot.get_group_member_info(
+            group_id=event.group_id,
+            user_id=event.user_id,
+            no_cache=True,
+        )
+    except Exception as e:
+        logger.error(
+            f"获取手动取消验证用户权限失败: {e}",
+            PLUGIN_MODULE,
+            target=event.group_id,
             e=e,
         )
         return False
@@ -241,10 +413,12 @@ async def _cancel_group_verifications_for_no_permission(
         task_group_id, task_user_id = key
         if task_group_id != group_id:
             continue
+        task_info = _pop_verification_task(key)
+        if not task_info:
+            continue
         task = task_info.get("task")
         if task:
             task.cancel()
-        del verification_tasks[key]
         cancelled_users.append(task_user_id)
 
     _release_reserved_group_welcome_cooldown(group_id)
@@ -388,7 +562,7 @@ async def timeout_kick(bot: Bot, group_id: int, user_id: int, timeout: int):
     await asyncio.sleep(timeout)
     key = (group_id, user_id)
     if key in verification_tasks:
-        del verification_tasks[key]
+        _pop_verification_task(key)
         try:
             await bot.set_group_kick(
                 group_id=group_id, user_id=user_id, reject_add_request=False
@@ -412,6 +586,20 @@ async def timeout_kick(bot: Bot, group_id: int, user_id: int, timeout: int):
                 user_id,
                 f"验证超时后踢出用户失败，可能是Bot没有群管理权限: {e}",
             )
+
+
+@driver.on_bot_connect
+async def _restore_pending_verifications(bot: Bot):
+    _load_pending_verifications_to_memory()
+    restored_count = 0
+    for key, task_info in list(verification_tasks.items()):
+        _schedule_timeout_task(bot, key, task_info)
+        restored_count += 1
+    if restored_count:
+        logger.info(
+            f"已恢复 {restored_count} 个进群验证待验证状态",
+            PLUGIN_MODULE,
+        )
 
 
 increase_notice = on_notice(priority=0, block=False)
@@ -558,6 +746,7 @@ async def _(bot: Bot, event: GroupIncreaseNoticeEvent | GroupAdminNoticeEvent):
     problem, answer = generate_math_problem()
     timeout = _get_config_value("timeout", 600)
     max_retries = _get_config_value("max_retries", 3)
+    expire_at = time.time() + timeout
 
     welcome_reserved = False
     if not await CommonUtils.task_is_block(bot, "group_welcome", str(group_id)):
@@ -567,8 +756,10 @@ async def _(bot: Bot, event: GroupIncreaseNoticeEvent | GroupAdminNoticeEvent):
         "answer": answer,
         "retries": 0,
         "max_retries": max_retries,
+        "expire_at": expire_at,
         "welcome_reserved": welcome_reserved,
     }
+    _save_pending_verifications()
 
     task = asyncio.create_task(timeout_kick(bot, group_id, user_id, timeout))
     verification_tasks[key]["task"] = task
@@ -580,12 +771,91 @@ async def _(bot: Bot, event: GroupIncreaseNoticeEvent | GroupAdminNoticeEvent):
     )
 
     logger.info(f"准备发送验证消息给群 {group_id} 的用户 {user_id}")
-    await msg.send()
+    receipt = await msg.send()
+    _bind_verification_message_ids(key, verification_tasks[key], receipt)
     logger.info("验证消息发送完成")
 
 
 def is_in_verification(event: GroupMessageEvent) -> bool:
     return (event.group_id, event.user_id) in verification_tasks
+
+
+def _resolve_verification_key_from_reply(
+    bot: Bot,
+    event: GroupMessageEvent,
+    reply: Any,
+    *,
+    require_pending: bool = True,
+) -> tuple[int, int] | None:
+    key = verification_message_index.get(str(reply.id))
+    if key and (not require_pending or key in verification_tasks):
+        return key
+
+    origin = getattr(reply, "origin", None)
+    sender = getattr(origin, "sender", None)
+    sender_id = getattr(sender, "user_id", None)
+    if sender_id is not None:
+        try:
+            if int(sender_id) != int(bot.self_id):
+                return None
+        except (TypeError, ValueError):
+            return None
+
+    for segment in getattr(reply, "msg", []) or []:
+        if getattr(segment, "type", None) != "at":
+            continue
+        user_id = getattr(segment, "data", {}).get("qq")
+        if not user_id or user_id == "all":
+            continue
+        try:
+            key = (event.group_id, int(user_id))
+        except (TypeError, ValueError):
+            continue
+        if not require_pending or key in verification_tasks:
+            return key
+    return None
+
+
+async def is_manual_cancel_verification(
+    bot: Bot,
+    event: GroupMessageEvent,
+    session: Uninfo,
+) -> bool:
+    if event.get_plaintext().strip() != "取消验证":
+        return False
+    reply = await reply_fetch(event, bot)
+    if not reply or not _resolve_verification_key_from_reply(
+        bot, event, reply, require_pending=False
+    ):
+        return False
+    return await _is_verification_admin(bot, event, session)
+
+
+manual_cancel_matcher = on_message(
+    rule=Rule(is_manual_cancel_verification), priority=3, block=True
+)
+
+
+@manual_cancel_matcher.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    reply = await reply_fetch(event, bot)
+    if not reply:
+        return
+
+    key = _resolve_verification_key_from_reply(bot, event, reply, require_pending=False)
+    if not key:
+        return
+
+    task_info = _pop_verification_task(key)
+    if task_info:
+        _cancel_timeout_task(task_info)
+        _release_reserved_group_welcome_cooldown(key[0])
+    await MessageUtils.build_message("已取消此次验证.").send(reply_to=True)
+    logger.info(
+        f"管理员 {event.user_id} 手动取消群 {key[0]} 用户 {key[1]} 的进群验证。",
+        PLUGIN_MODULE,
+        target=key[0],
+    )
 
 
 verification_matcher = on_message(
@@ -627,8 +897,8 @@ async def _(bot: Bot, event: GroupMessageEvent):
         pass
 
     if is_correct:
-        task_info["task"].cancel()
-        del verification_tasks[key]
+        _cancel_timeout_task(task_info)
+        _pop_verification_task(key)
         success_msg = MessageUtils.build_message("验证通过~")
         if not await CommonUtils.task_is_block(bot, "group_welcome", str(group_id)):
             try:
@@ -650,11 +920,12 @@ async def _(bot: Bot, event: GroupMessageEvent):
     else:
         # 无论是发错数字还是发非数字，都算作一次失败尝试
         task_info["retries"] += 1
+        _save_pending_verifications()
         remaining = task_info["max_retries"] - task_info["retries"]
 
         if remaining <= 0:
-            task_info["task"].cancel()
-            del verification_tasks[key]
+            _cancel_timeout_task(task_info)
+            _pop_verification_task(key)
             await MessageUtils.build_message("验证失败次数过多，已移出群聊。").send(
                 reply_to=True
             )
